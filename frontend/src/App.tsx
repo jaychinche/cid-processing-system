@@ -8,7 +8,7 @@ function App() {
     <Router>
       <Routes>
         {/* Public routes - no protection */}
-        <Route path="/login" element={<AuthPage />} />
+        <Route path="/" element={<AuthPage />} />
         <Route path="/dashboard" element={<Dashboard />} />
       </Routes>
     </Router>
