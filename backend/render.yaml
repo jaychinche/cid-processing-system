@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: cid-flask-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: FLASK_ENV
+        value: production
+      - key: MONGO_URI
+        value: mongodb+srv://chinchejay:ACp9z07Sgz1XqSEw@cluster0.mkrwdan.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0
+      - key: DB_NAME
+        value: your_database_name
+      - key: BASE_URL
+        value: http://localhost:9200
