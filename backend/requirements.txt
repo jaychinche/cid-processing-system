@@ -1,1 +1,11 @@
-
+flask
+flask-cors
+pymongo
+openpyxl
+pandas
+selenium
+webdriver-manager
+requests
+python-dotenv
+certifi
+gunicorn
