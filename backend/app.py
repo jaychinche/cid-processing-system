@@ -663,8 +663,8 @@ def delete_collection(collection_name):
         return jsonify({'error': str(e)}), 500
  
 if __name__ == '__main__':
-    PORT=os.getenv('PORT')
-    print(f"🚀 Flask Backend Running on http://127.0.0.1:{PORT}")
+    port=os.getenv('PORT')
+    print(f"🚀 Flask Backend Running on http://127.0.0.1:{port}")
     app.run(host='0.0.0.0', port=port, debug=True)
 
 
