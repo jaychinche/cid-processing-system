@@ -24,7 +24,8 @@ from auth_routes import auth_bp
 from dotenv import load_dotenv
 import certifi 
 app = Flask(__name__)
-CORS(app)  # Allow requests from frontend (e.g. React/Vue)
+CORS(app, resources={r"/*": {"origins": "https://cid-processing-system.vercel.app"}}, supports_credentials=True)
+
 
 # === Global State ===
 should_pause = False
