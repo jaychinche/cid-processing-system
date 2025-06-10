@@ -665,7 +665,7 @@ def delete_collection(collection_name):
 if __name__ == '__main__':
     PORT=os.getenv('PORT')
     print(f"🚀 Flask Backend Running on http://127.0.0.1:{PORT}")
-    app.run(debug=True, port=10000)
+    app.run(host='0.0.0.0', port=port, debug=True)
 
 
 
