@@ -9,3 +9,5 @@ python-dotenv==1.0.0
 certifi==2023.7.22
 requests==2.31.0
 gunicorn==21.2.0
+numpy==1.24.4
+pandas==1.5.3
