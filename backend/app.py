@@ -625,31 +625,28 @@ def stop_processing():
 @app.route('/status', methods=['GET'])
 def get_status():
     try:
-        collection_name = request.args.get('collection', current_collection_name or 'default_collection')
+        collection_name = request.args.get('collection') or current_collection_name or 'default_collection'
+        print(f"Checking status for collection: {collection_name}")
+
         collection = get_collection(collection_name)
-        
+        if not collection:
+            raise Exception(f"Collection '{collection_name}' not found")
+
         total = collection.count_documents({})
         processed = collection.count_documents({'status': 'processed'})
         failed = collection.count_documents({'status': 'failed'})
         new = collection.count_documents({'status': 'new'})
         processing = collection.count_documents({'status': 'processing'})
 
-        # Get all unique tags in the collection
-        tags = collection.distinct('tag')
-
         return jsonify({
             'total': total,
             'processed': processed,
             'failed': failed,
             'new': new,
-            'processing': processing,
-            'processing_active': processing_active,
-            'active_workers': active_workers,
-            'paused': should_pause,
-            'current_collection': collection_name,
-            'tags': tags
-        })
+            'processing': processing
+        }), 200
     except Exception as e:
+        print(f"[ERROR] /status failed: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/download', methods=['GET'])
