@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Upload, FileText, Settings, Play, Pause, RefreshCw, StopCircle, Download, Trash2 } from 'lucide-react';
 
 const Dashboard = () => {
-  const API_BASE_URL = 'http://localhost:9200';
+  const API_BASE_URL = 'https://cid-2.onrender.com';
   
   // State for form inputs
   const [tagInput, setTagInput] = useState('');
