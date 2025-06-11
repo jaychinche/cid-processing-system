@@ -9,3 +9,4 @@ requests
 python-dotenv
 certifi
 gunicorn
+fake-useragent
