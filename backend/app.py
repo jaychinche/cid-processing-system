@@ -15,7 +15,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
 from selenium.webdriver.chrome.service import Service as ChromeService
 from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.chrome.options import Options
 import requests
 import threading
 import signal
@@ -24,13 +23,12 @@ from concurrent.futures import ThreadPoolExecutor
 from auth_routes import auth_bp
 from dotenv import load_dotenv
 import certifi 
-from fake_useragent import UserAgent
-
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "https://cid-processing-system.vercel.app"}}, supports_credentials=True)
 
 # Load environment variables
 load_dotenv()
+
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "https://cid-processing-system.vercel.app"}}, supports_credentials=True)
 
 # === Global State ===
 should_pause = False
@@ -38,69 +36,103 @@ should_stop = False
 active_workers = 0
 processing_active = False
 worker_threads = []
-current_collection_name = None  # Track the current collection being processed
+current_collection_name = None
 
-# === Database Configuration ===
+# === Database Setup ===
 MONGO_URI = os.getenv('MONGO_URI')
-client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
-DB_NAME = os.getenv('DB_NAME', 'default_database')
-db = client[DB_NAME]
+DB_NAME = os.getenv('DB_NAME')
+
+# Initialize MongoDB connection
+try:
+    client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
+    db = client[DB_NAME] if DB_NAME else client['default_db']
+    print(f"✅ Connected to MongoDB database: {db.name}")
+except Exception as e:
+    print(f"❌ MongoDB connection failed: {e}")
+    db = None
 
 # === Scraping Configuration ===
 URL = "https://www.apeasternpower.com/viewBillDetailsMain"
-CHECK_INTERVAL = 5  # Seconds between status checks
+CHECK_INTERVAL = 5
 CHECK_INTERNET_URL = "http://www.google.com"
 MAX_RETRIES = 3
 RETRY_DELAY = 10
-BATCH_SIZE = 10  # Number of CIDs each worker processes at a time
-
-# User agent generator
-ua = UserAgent()
-
-def get_collection(collection_name):
-    """Get a MongoDB collection by name"""
-    return db[collection_name]
-
-def get_browser_headers():
-    """Generate random browser headers"""
-    return {
-        'User-Agent': ua.random,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
-        'Cache-Control': 'max-age=0'
-    }
+BATCH_SIZE = 10
 
 def get_chrome_options():
-    """Configure Chrome options with anti-detection measures"""
-    options = Options()
+    """Get Chrome options optimized for server deployment"""
+    options = webdriver.ChromeOptions()
     
-    # Standard headless options
-    options.add_argument('--headless')
+    # Essential headless options for server
+    options.add_argument('--headless=new')  # Use new headless mode
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--disable-extensions')
+    options.add_argument('--disable-plugins')
+    options.add_argument('--disable-images')  # Don't load images for faster scraping
+    options.add_argument('--disable-javascript')  # Only if the site works without JS
     
-    # Anti-bot detection measures
-    options.add_argument(f'user-agent={ua.random}')
-    options.add_argument('--disable-blink-features=AutomationControlled')
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option('useAutomationExtension', False)
+    # Memory and performance optimizations
+    options.add_argument('--memory-pressure-off')
+    options.add_argument('--max_old_space_size=4096')
+    options.add_argument('--disable-background-timer-throttling')
+    options.add_argument('--disable-renderer-backgrounding')
+    options.add_argument('--disable-backgrounding-occluded-windows')
     
-    # Proxy configuration (if available)
-    if os.getenv('PROXY_SERVER'):
-        options.add_argument(f'--proxy-server={os.getenv("PROXY_SERVER")}')
+    # Network and security
+    options.add_argument('--disable-web-security')
+    options.add_argument('--disable-features=VizDisplayCompositor')
+    options.add_argument('--disable-ipc-flooding-protection')
+    
+    # Window size for consistent rendering
+    options.add_argument('--window-size=1920,1080')
+    
+    # User agent to avoid bot detection
+    options.add_argument('--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+    
+    # Additional server-specific options
+    options.add_argument('--remote-debugging-port=9222')
+    options.add_argument('--disable-background-networking')
+    options.add_argument('--disable-sync')
+    options.add_argument('--disable-translate')
+    options.add_argument('--disable-default-apps')
     
     return options
 
+def create_webdriver():
+    """Create a webdriver instance with proper error handling"""
+    try:
+        options = get_chrome_options()
+        
+        # Try to create driver with ChromeDriverManager first
+        try:
+            service = ChromeService(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+        except Exception as e:
+            print(f"⚠️ ChromeDriverManager failed: {e}")
+            # Fallback to system chrome
+            driver = webdriver.Chrome(options=options)
+        
+        # Set timeouts
+        driver.set_page_load_timeout(30)
+        driver.implicitly_wait(10)
+        
+        return driver
+        
+    except Exception as e:
+        print(f"❌ Failed to create webdriver: {e}")
+        raise
+
+def get_collection(collection_name):
+    """Get a MongoDB collection by name"""
+    if not db:
+        raise Exception("Database not connected")
+    return db[collection_name]
+
 app.register_blueprint(auth_bp, url_prefix='/api/auth')
 
-@app.route('/send-dbname',methods=['POST'])
+@app.route('/send-dbname', methods=['POST'])
 def get_user_db():
     """Get the user database collection"""
     return get_userdb('user_db')
@@ -116,6 +148,8 @@ def set_db():
         return jsonify({'error': 'Database name is required'}), 400
 
     try:
+        MONGO_URI = os.getenv('MONGO_URI')
+        client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
         db = client[db_name]
         DB_NAME = db_name
         print(f"✅ Database set to: {DB_NAME}")
@@ -127,8 +161,7 @@ def signal_handler(sig, frame):
     global should_stop
     print("\n🛑 Received interrupt signal. Stopping gracefully...")
     should_stop = True
-    if processing_active:
-        sys.exit(0)
+    sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
 
@@ -143,11 +176,12 @@ def convert_date_fields(doc):
 def check_internet_connection():
     """Check if internet connection is available"""
     try:
-        response = requests.get(CHECK_INTERNET_URL, 
-                              headers=get_browser_headers(),
-                              timeout=5)
+        response = requests.get(CHECK_INTERNET_URL, timeout=10, headers={
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+        })
         return response.status_code == 200
-    except requests.ConnectionError:
+    except requests.RequestException as e:
+        print(f"❌ Internet check failed: {e}")
         return False
 
 def wait_for_internet():
@@ -175,7 +209,6 @@ def clean_amount(amount_text):
     if not amount_text:
         return None
     
-    # Remove commas and any non-numeric characters except decimal point
     cleaned = ''.join(c for c in amount_text if c.isdigit() or c == '.')
     
     try:
@@ -184,7 +217,7 @@ def clean_amount(amount_text):
         return None
 
 def process_cid(driver, cid):
-    """Process a single CID using Selenium with anti-detection measures"""
+    """Process a single CID using Selenium with improved error handling"""
     retries = 0
     while retries < MAX_RETRIES and not should_stop:
         try:
@@ -193,133 +226,150 @@ def process_cid(driver, cid):
                 if should_stop:
                     return None
             
-            # Add random delay between requests
-            time.sleep(random.uniform(1, 3))
+            print(f"🔍 Processing CID {cid} (attempt {retries + 1})")
             
-            # Navigate to URL with random headers
+            # Navigate to the page
             driver.get(URL)
-            time.sleep(2)
+            time.sleep(3)  # Increased wait time
 
-            # Random mouse movements to appear human-like
+            # Enter CID with better error handling
             try:
-                element = driver.find_element(By.ID, 'ltscno')
-                webdriver.ActionChains(driver).move_to_element(element).perform()
-                time.sleep(0.5)
-            except:
-                pass
+                cid_field = WebDriverWait(driver, 15).until(
+                    EC.element_to_be_clickable((By.ID, 'ltscno'))
+                )
+                cid_field.clear()
+                cid_field.send_keys(str(cid))
+            except TimeoutException:
+                raise Exception("CID input field not found or not clickable")
 
-            # Enter CID
-            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, 'ltscno')))
-            cid_field = driver.find_element(By.ID, 'ltscno')
-            for char in cid:
-                cid_field.send_keys(char)
-                time.sleep(random.uniform(0.1, 0.3))  # Type like a human
-
-            # Solve CAPTCHA
-            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, 'Billquestion')))
-            captcha_text = driver.execute_script("return document.getElementById('Billquestion').innerText;").strip()
-            
-            captcha_field = driver.find_element(By.ID, 'Billans')
-            for char in captcha_text:
-                captcha_field.send_keys(char)
-                time.sleep(random.uniform(0.1, 0.2))
+            # Handle CAPTCHA
+            try:
+                captcha_element = WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located((By.ID, 'Billquestion'))
+                )
+                captcha_text = driver.execute_script("return arguments[0].innerText;", captcha_element).strip()
                 
-            time.sleep(1)  # Wait before clicking
-            
-            # Click submit with human-like action
-            submit_button = driver.find_element(By.ID, 'Billsignin')
-            webdriver.ActionChains(driver).move_to_element(submit_button).click().perform()
-            time.sleep(2)
+                if not captcha_text:
+                    raise Exception("CAPTCHA text is empty")
+                
+                answer_field = driver.find_element(By.ID, 'Billans')
+                answer_field.clear()
+                answer_field.send_keys(captcha_text)
+                
+                submit_btn = driver.find_element(By.ID, 'Billsignin')
+                driver.execute_script("arguments[0].click();", submit_btn)
+                time.sleep(3)
+                
+            except Exception as e:
+                raise Exception(f"CAPTCHA handling failed: {str(e)}")
 
-            # Check for CAPTCHA error alert
+            # Check for alerts/errors
             try:
+                WebDriverWait(driver, 2).until(EC.alert_is_present())
                 alert = driver.switch_to.alert
                 alert_text = alert.text
                 alert.accept()
-                raise Exception(f"CAPTCHA validation failed: {alert_text}")
-            except:
-                pass
+                raise Exception(f"Alert appeared: {alert_text}")
+            except TimeoutException:
+                pass  # No alert is good
 
-            # Click History with human-like behavior
+            # Click History button
             try:
-                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "historyDivbtn")))
-                driver.execute_script("window.scrollBy(0, 280)")
+                WebDriverWait(driver, 15).until(
+                    EC.element_to_be_clickable((By.ID, "historyDivbtn"))
+                )
+                driver.execute_script("window.scrollBy(0, 300);")
                 time.sleep(2)
                 
-                history_button = driver.find_element(By.ID, "historyDivbtn")
-                webdriver.ActionChains(driver).move_to_element(history_button).click().perform()
+                history_btn = driver.find_element(By.ID, "historyDivbtn")
+                driver.execute_script("arguments[0].click();", history_btn)
+                time.sleep(3)
+                
             except TimeoutException:
-                raise Exception("CAPTCHA failed or no history button")
+                raise Exception("History button not found - possible CAPTCHA failure")
 
-            # Scrape data
-            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "consumptionData")))
-            rows = driver.find_element(By.ID, "consumptionData").find_elements(By.TAG_NAME, "tr")[1:]
-            
-            if not rows:
-                raise Exception("No data rows found")
+            # Scrape consumption data
+            try:
+                data_table = WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located((By.ID, "consumptionData"))
+                )
+                rows = data_table.find_elements(By.TAG_NAME, "tr")[1:]  # Skip header
+                
+                if not rows:
+                    raise Exception("No data rows found in consumption table")
 
-            # Prepare data dictionary for months April25, May25, June25
-            monthly_amounts = {}
-            amounts = []  # To store all amounts for calculating highest
-            
-            for row in rows:
-                cells = row.find_elements(By.TAG_NAME, "td")
-                if len(cells) < 4:
-                    continue
+                monthly_amounts = {}
+                amounts = []
                 
-                bill_month = cells[1].text.strip().upper()
-                try:
-                    amount_text = cells[3].find_element(By.TAG_NAME, "input").get_attribute("value").strip()
-                except NoSuchElementException:
-                    amount_text = cells[3].text.strip()
-                
-                amount = clean_amount(amount_text)
-                
-                # Map bill months to our field names
-                if 'APR' in bill_month or 'APRIL' in bill_month:
-                    monthly_amounts['April25'] = amount
-                elif 'MAY' in bill_month:
-                    monthly_amounts['May25'] = amount
-                elif 'JUN' in bill_month or 'JUNE' in bill_month:
-                    monthly_amounts['June25'] = amount
-                
-                if amount is not None:
-                    amounts.append(amount)
+                for row in rows:
+                    cells = row.find_elements(By.TAG_NAME, "td")
+                    if len(cells) < 4:
+                        continue
+                    
+                    bill_month = cells[1].text.strip().upper()
+                    
+                    # Try to get amount from input field first, then cell text
+                    try:
+                        amount_element = cells[3].find_element(By.TAG_NAME, "input")
+                        amount_text = amount_element.get_attribute("value").strip()
+                    except NoSuchElementException:
+                        amount_text = cells[3].text.strip()
+                    
+                    amount = clean_amount(amount_text)
+                    
+                    # Map bill months to field names
+                    if 'APR' in bill_month or 'APRIL' in bill_month:
+                        monthly_amounts['April25'] = amount
+                    elif 'MAY' in bill_month:
+                        monthly_amounts['May25'] = amount
+                    elif 'JUN' in bill_month or 'JUNE' in bill_month:
+                        monthly_amounts['June25'] = amount
+                    
+                    if amount is not None:
+                        amounts.append(amount)
 
-            # Calculate Highest amount among the three months
-            if amounts:
-                monthly_amounts['Highest'] = max(amounts)
+                # Calculate highest amount
+                if amounts:
+                    monthly_amounts['Highest'] = max(amounts)
 
-            return monthly_amounts
+                return monthly_amounts
+
+            except TimeoutException:
+                raise Exception("Consumption data table not found")
 
         except Exception as e:
             retries += 1
-            print(f"⚠ Attempt {retries}/{MAX_RETRIES} failed for CID {cid}: {str(e)[:100]}")
+            error_msg = str(e)[:150]
+            print(f"⚠️ Attempt {retries}/{MAX_RETRIES} failed for CID {cid}: {error_msg}")
+            
             if retries < MAX_RETRIES and not should_stop:
-                time.sleep(RETRY_DELAY * retries)  # Exponential backoff
+                print(f"🔄 Retrying CID {cid} in {RETRY_DELAY} seconds...")
+                time.sleep(RETRY_DELAY)
+                
+                # Try to refresh the page for next attempt
+                try:
+                    driver.refresh()
+                    time.sleep(3)
+                except:
+                    pass
             else:
-                print(f"❌ Failed to process CID {cid} after {MAX_RETRIES} attempts")
+                print(f"❌ All attempts failed for CID {cid}")
                 raise e
+    
     return None
 
 def worker_thread(worker_id, collection_name):
-    """Worker function that runs the scraping process for a batch of CIDs"""
+    """Worker function with improved driver management"""
     global should_pause, should_stop, active_workers
     
     driver = None
     try:
-        # Setup browser for this worker with anti-detection measures
-        driver = webdriver.Chrome(
-            service=ChromeService(ChromeDriverManager().install()),
-            options=get_chrome_options()
-        )
+        print(f"👷 Worker {worker_id} starting for collection {collection_name}")
         
-        # Additional stealth settings
-        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        # Create webdriver for this worker
+        driver = create_webdriver()
+        print(f"✅ Worker {worker_id} webdriver created successfully")
         
-        print(f"👷 Worker {worker_id} started for collection {collection_name}")
-        
-        # Get the collection for this worker
         collection = get_collection(collection_name)
         
         while not should_stop:
@@ -327,73 +377,58 @@ def worker_thread(worker_id, collection_name):
                 should_stop = True
                 break
                 
-            # Fetch batch of CIDs to process
-            batch = []
             try:
-                # Find documents that need processing
+                # Fetch batch of CIDs to process
                 docs_to_process = list(collection.find(
                     {'status': 'new'}, 
                     limit=BATCH_SIZE
                 ))
                 
                 if not docs_to_process:
-                    print(f"ℹ Worker {worker_id}: No more CIDs to process in collection {collection_name}")
+                    print(f"ℹ️ Worker {worker_id}: No more CIDs to process")
                     break
                 
-                # Update their status to 'processing' atomically
+                # Update status atomically
                 doc_ids = [doc['_id'] for doc in docs_to_process]
                 update_result = collection.update_many(
-                    {'_id': {'$in': doc_ids}, 'status': 'new'},  # Double-check they're still 'new'
+                    {'_id': {'$in': doc_ids}, 'status': 'new'},
                     {'$set': {'status': 'processing'}}
                 )
                 
                 if update_result.modified_count == 0:
-                    print(f"ℹ Worker {worker_id}: Documents were already taken by another worker")
-                    time.sleep(2)  # Avoid tight loop
                     continue
                 
-                # Get the updated documents
                 batch = list(collection.find({'_id': {'$in': doc_ids}, 'status': 'processing'}))
+                print(f"👷 Worker {worker_id} processing {len(batch)} CIDs")
                 
-                if not batch:
-                    print(f"ℹ Worker {worker_id}: No documents to process in this batch")
-                    continue
-                
-                print(f"👷 Worker {worker_id} processing batch of {len(batch)} CIDs from collection {collection_name}")
-                
-                processed_ids = []
-                failed_ids = []
+                processed_count = 0
+                failed_count = 0
                 
                 for doc in batch:
                     if should_stop:
                         break
                         
                     cid = doc['cid']
-                    print(f"🔍 Worker {worker_id} processing CID {cid}")
                     
                     try:
                         monthly_data = process_cid(driver, cid)
                         if monthly_data is not None:
-                            # Prepare update data with month-wise amounts
                             update_data = {
-                                'status': 'pending',
+                                'status': 'processed',
                                 'processed_date': datetime.now(),
-                                **monthly_data  # Add April25, May25, June25, Highest fields directly
+                                **monthly_data
                             }
-
-                            update_data = convert_date_fields(update_data)
-
+                            
                             collection.update_one(
                                 {'_id': doc['_id']},
                                 {'$set': update_data}
                             )
-                            processed_ids.append(doc['_id'])
-                            print(f"✅ Worker {worker_id} processed CID {cid} - April25: {monthly_data.get('April25', 'N/A')}, May25: {monthly_data.get('May25', 'N/A')}, June25: {monthly_data.get('June25', 'N/A')}, Highest: {monthly_data.get('Highest', 'N/A')}")
+                            processed_count += 1
+                            print(f"✅ Worker {worker_id} processed CID {cid}")
                         else:
-                            raise Exception("No monthly data returned from scraping")
+                            raise Exception("No data returned from scraping")
                             
                     except Exception as e:
-                        print(f"❌ Worker {worker_id} failed to process CID {cid}: {str(e)[:100]}...")
                         collection.update_one(
                             {'_id': doc['_id']},
                             {'$set': {
@@ -402,43 +437,151 @@ def worker_thread(worker_id, collection_name):
                                 'processed_date': datetime.now()
                             }}
                         )
-                        failed_ids.append(doc['_id'])
+                        failed_count += 1
+                        print(f"❌ Worker {worker_id} failed CID {cid}: {str(e)[:100]}")
                 
-                # After batch processed, update status of all successfully processed documents from 'pending' to 'processed'
-                if processed_ids:
-                    collection.update_many(
-                        {'_id': {'$in': processed_ids}, 'status': 'pending'},
-                        {'$set': {'status': 'processed'}}
-                    )
-                    print(f"🔄 Worker {worker_id} updated status of {len(processed_ids)} CIDs from 'pending' to 'processed'")
+                print(f"📊 Worker {worker_id} batch complete: {processed_count} success, {failed_count} failed")
+                time.sleep(2)  # Brief pause between batches
                 
-                print(f"👷 Worker {worker_id} processed batch: {len(processed_ids)} success, {len(failed_ids)} failed")
-                
-                # Random delay between batches
-                time.sleep(random.uniform(2, 5))
-            
             except Exception as e:
-                print(f"❌ Worker {worker_id} failed to fetch batch: {str(e)}")
-                # If we failed to process the batch, mark them back as 'new' so other workers can try
-                if batch:
-                    collection.update_many(
-                        {'_id': {'$in': [doc['_id'] for doc in batch]}, 'status': 'processing'},
-                        {'$set': {'status': 'new'}}
-                    )
-                time.sleep(10)  # Longer wait before retrying
+                print(f"❌ Worker {worker_id} batch error: {str(e)}")
+                time.sleep(5)
         
-        print(f"🏁 Worker {worker_id} finished for collection {collection_name}")
+        print(f"🏁 Worker {worker_id} finished")
         
     except Exception as e:
-        print(f"❌ Worker {worker_id} failed with error: {str(e)}")
+        print(f"❌ Worker {worker_id} critical error: {str(e)}")
     finally:
         active_workers -= 1
         if driver:
             try:
                 driver.quit()
-                print(f"🚪 Worker {worker_id} browser closed")
+                print(f"🚪 Worker {worker_id} driver closed")
             except:
                 pass
+
+# Rest of your Flask routes remain the same...
+@app.route('/upload', methods=['POST'])
+def upload_excel():
+    file = request.files.get('file')
+    tag = request.form.get('tag', 'default')
+    collection_name = request.form.get('collection', 'default_collection')
+    
+    if not file:
+        return jsonify({'error': 'No file uploaded'}), 400
+    
+    try:
+        collection = get_collection(collection_name)
+        wb = openpyxl.load_workbook(file)
+        ws = wb.active
+        cids = []
+
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            cid = row[0]
+            if cid:
+                doc = {
+                    'cid': str(cid).strip(),
+                    'status': 'new',
+                    'April25': None,
+                    'May25': None,
+                    'June25': None,
+                    'Highest': None,
+                    'date_added': datetime.now(),
+                    'tag': tag,
+                    'collection': collection_name
+                }
+                cids.append(doc)
+
+        if cids:
+            existing_cids = set(doc['cid'] for doc in collection.find(
+                {'tag': tag, 'collection': collection_name}, 
+                {'cid': 1}
+            ))
+            
+            new_docs = [doc for doc in cids if doc['cid'] not in existing_cids]
+            
+            if new_docs:
+                collection.insert_many(new_docs)
+                return jsonify({
+                    'inserted': len(new_docs), 
+                    'skipped': len(cids) - len(new_docs),
+                    'tag': tag,
+                    'collection': collection_name
+                })
+            else:
+                return jsonify({
+                    'inserted': 0,
+                    'skipped': len(cids),
+                    'message': 'All CIDs already exist in database',
+                    'tag': tag,
+                    'collection': collection_name
+                })
+
+        return jsonify({'message': 'No CID records found in the file'}), 204
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/start', methods=['POST'])
+def start_processing():
+    global worker_threads, should_stop, should_pause, active_workers, processing_active, current_collection_name
+    
+    if processing_active:
+        return jsonify({'message': 'Processing is already running'}), 200
+    
+    try:
+        data = request.get_json()
+        num_workers = data.get('workers', 1)
+        collection_name = data.get('collection', 'default_collection')
+        
+        num_workers = max(1, min(num_workers, 5))  # Limit workers for server stability
+        
+        should_stop = False
+        should_pause = False
+        processing_active = True
+        active_workers = num_workers
+        current_collection_name = collection_name
+        
+        worker_threads = []
+        
+        for i in range(num_workers):
+            t = threading.Thread(target=worker_thread, args=(i+1, collection_name))
+            t.daemon = True  # Make threads daemon
+            t.start()
+            worker_threads.append(t)
+        
+        return jsonify({
+            'message': f'Processing started with {num_workers} workers on collection {collection_name}',
+            'workers': num_workers,
+            'collection': collection_name
+        }), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+# Add health check endpoint
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint for server monitoring"""
+    try:
+        # Test database connection
+        db.command('ping')
+        db_status = "connected"
+    except:
+        db_status = "disconnected"
+    
+    # Test internet connection
+    internet_status = "connected" if check_internet_connection() else "disconnected"
+    
+    return jsonify({
+        'status': 'healthy',
+        'database': db_status,
+        'internet': internet_status,
+        'processing_active': processing_active,
+        'active_workers': active_workers
+    })
+
+# Your other routes (pause, resume, stop, status, download, collections) remain the same...
 
 @app.route('/upload', methods=['POST'])
 def upload_excel():
@@ -735,8 +878,9 @@ def delete_collection(collection_name):
         return jsonify({'message': f'Collection {collection_name} deleted successfully'}), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-    
+ 
+
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 10000))
-    print(f"🚀 Flask Backend Running on http://127.0.0.1:{port}")
-    app.run(host='0.0.0.0', port=port, debug=True)
+    print(f"🚀 Flask Backend Running on http://0.0.0.0:{port}")
+    app.run(host='0.0.0.0', port=port, debug=False)  # Set debug=False for production
