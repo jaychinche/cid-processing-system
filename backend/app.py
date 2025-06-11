@@ -15,6 +15,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
 from selenium.webdriver.chrome.service import Service as ChromeService
 from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.options import Options
 import requests
 import threading
 import signal
@@ -23,9 +24,13 @@ from concurrent.futures import ThreadPoolExecutor
 from auth_routes import auth_bp
 from dotenv import load_dotenv
 import certifi 
+from fake_useragent import UserAgent
+
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "https://cid-processing-system.vercel.app"}}, supports_credentials=True)
 
+# Load environment variables
+load_dotenv()
 
 # === Global State ===
 should_pause = False
@@ -35,10 +40,11 @@ processing_active = False
 worker_threads = []
 current_collection_name = None  # Track the current collection being processed
 
-
-db =os.getenv('db')
-DB_NAME = os.getenv('DB_NAME')
-client = os.getenv('client')
+# === Database Configuration ===
+MONGO_URI = os.getenv('MONGO_URI')
+client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
+DB_NAME = os.getenv('DB_NAME', 'default_database')
+db = client[DB_NAME]
 
 # === Scraping Configuration ===
 URL = "https://www.apeasternpower.com/viewBillDetailsMain"
@@ -48,10 +54,49 @@ MAX_RETRIES = 3
 RETRY_DELAY = 10
 BATCH_SIZE = 10  # Number of CIDs each worker processes at a time
 
+# User agent generator
+ua = UserAgent()
+
 def get_collection(collection_name):
     """Get a MongoDB collection by name"""
     return db[collection_name]
 
+def get_browser_headers():
+    """Generate random browser headers"""
+    return {
+        'User-Agent': ua.random,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'max-age=0'
+    }
+
+def get_chrome_options():
+    """Configure Chrome options with anti-detection measures"""
+    options = Options()
+    
+    # Standard headless options
+    options.add_argument('--headless')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    
+    # Anti-bot detection measures
+    options.add_argument(f'user-agent={ua.random}')
+    options.add_argument('--disable-blink-features=AutomationControlled')
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option('useAutomationExtension', False)
+    
+    # Proxy configuration (if available)
+    if os.getenv('PROXY_SERVER'):
+        options.add_argument(f'--proxy-server={os.getenv("PROXY_SERVER")}')
+    
+    return options
 
 app.register_blueprint(auth_bp, url_prefix='/api/auth')
 
@@ -59,7 +104,6 @@ app.register_blueprint(auth_bp, url_prefix='/api/auth')
 def get_user_db():
     """Get the user database collection"""
     return get_userdb('user_db')
-
 
 @app.route('/set-db', methods=['POST'])
 def set_db():
@@ -72,17 +116,12 @@ def set_db():
         return jsonify({'error': 'Database name is required'}), 400
 
     try:
-        MONGO_URI = os.getenv('MONGO_URI')
-        # client = MongoClient(MONGO_URI)
-        client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
-
         db = client[db_name]
         DB_NAME = db_name
         print(f"✅ Database set to: {DB_NAME}")
         return jsonify({'message': f'Database set to {DB_NAME}'}), 200
     except Exception as e:
         return jsonify({'error': f'Failed to connect to database: {str(e)}'}), 500
-
 
 def signal_handler(sig, frame):
     global should_stop
@@ -104,8 +143,10 @@ def convert_date_fields(doc):
 def check_internet_connection():
     """Check if internet connection is available"""
     try:
-        requests.get(CHECK_INTERNET_URL, timeout=5)
-        return True
+        response = requests.get(CHECK_INTERNET_URL, 
+                              headers=get_browser_headers(),
+                              timeout=5)
+        return response.status_code == 200
     except requests.ConnectionError:
         return False
 
@@ -143,7 +184,7 @@ def clean_amount(amount_text):
         return None
 
 def process_cid(driver, cid):
-    """Process a single CID using Selenium"""
+    """Process a single CID using Selenium with anti-detection measures"""
     retries = 0
     while retries < MAX_RETRIES and not should_stop:
         try:
@@ -152,18 +193,42 @@ def process_cid(driver, cid):
                 if should_stop:
                     return None
             
+            # Add random delay between requests
+            time.sleep(random.uniform(1, 3))
+            
+            # Navigate to URL with random headers
             driver.get(URL)
             time.sleep(2)
 
+            # Random mouse movements to appear human-like
+            try:
+                element = driver.find_element(By.ID, 'ltscno')
+                webdriver.ActionChains(driver).move_to_element(element).perform()
+                time.sleep(0.5)
+            except:
+                pass
+
             # Enter CID
             WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, 'ltscno')))
-            driver.find_element(By.ID, 'ltscno').send_keys(cid)
+            cid_field = driver.find_element(By.ID, 'ltscno')
+            for char in cid:
+                cid_field.send_keys(char)
+                time.sleep(random.uniform(0.1, 0.3))  # Type like a human
 
             # Solve CAPTCHA
             WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, 'Billquestion')))
             captcha_text = driver.execute_script("return document.getElementById('Billquestion').innerText;").strip()
-            driver.find_element(By.ID, 'Billans').send_keys(captcha_text)
-            driver.find_element(By.ID, 'Billsignin').click()
+            
+            captcha_field = driver.find_element(By.ID, 'Billans')
+            for char in captcha_text:
+                captcha_field.send_keys(char)
+                time.sleep(random.uniform(0.1, 0.2))
+                
+            time.sleep(1)  # Wait before clicking
+            
+            # Click submit with human-like action
+            submit_button = driver.find_element(By.ID, 'Billsignin')
+            webdriver.ActionChains(driver).move_to_element(submit_button).click().perform()
             time.sleep(2)
 
             # Check for CAPTCHA error alert
@@ -175,12 +240,14 @@ def process_cid(driver, cid):
             except:
                 pass
 
-            # Click History
+            # Click History with human-like behavior
             try:
                 WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "historyDivbtn")))
                 driver.execute_script("window.scrollBy(0, 280)")
                 time.sleep(2)
-                driver.find_element(By.ID, "historyDivbtn").click()
+                
+                history_button = driver.find_element(By.ID, "historyDivbtn")
+                webdriver.ActionChains(driver).move_to_element(history_button).click().perform()
             except TimeoutException:
                 raise Exception("CAPTCHA failed or no history button")
 
@@ -229,8 +296,9 @@ def process_cid(driver, cid):
             retries += 1
             print(f"⚠ Attempt {retries}/{MAX_RETRIES} failed for CID {cid}: {str(e)[:100]}")
             if retries < MAX_RETRIES and not should_stop:
-                time.sleep(RETRY_DELAY)
+                time.sleep(RETRY_DELAY * retries)  # Exponential backoff
             else:
+                print(f"❌ Failed to process CID {cid} after {MAX_RETRIES} attempts")
                 raise e
     return None
 
@@ -240,12 +308,14 @@ def worker_thread(worker_id, collection_name):
     
     driver = None
     try:
-        # Setup browser for this worker
-        options = webdriver.ChromeOptions()
-        options.add_argument('--headless')  # Run in headless mode for production
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
+        # Setup browser for this worker with anti-detection measures
+        driver = webdriver.Chrome(
+            service=ChromeService(ChromeDriverManager().install()),
+            options=get_chrome_options()
+        )
+        
+        # Additional stealth settings
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
         print(f"👷 Worker {worker_id} started for collection {collection_name}")
         
@@ -279,6 +349,7 @@ def worker_thread(worker_id, collection_name):
                 
                 if update_result.modified_count == 0:
                     print(f"ℹ Worker {worker_id}: Documents were already taken by another worker")
+                    time.sleep(2)  # Avoid tight loop
                     continue
                 
                 # Get the updated documents
@@ -306,7 +377,7 @@ def worker_thread(worker_id, collection_name):
                             # Prepare update data with month-wise amounts
                             update_data = {
                                 'status': 'pending',
-                                'processed_date': datetime.now().date(),
+                                'processed_date': datetime.now(),
                                 **monthly_data  # Add April25, May25, June25, Highest fields directly
                             }
 
@@ -328,7 +399,7 @@ def worker_thread(worker_id, collection_name):
                             {'$set': {
                                 'status': 'failed',
                                 'error': str(e)[:500],
-                                'processed_date': datetime.now().date()
+                                'processed_date': datetime.now()
                             }}
                         )
                         failed_ids.append(doc['_id'])
@@ -343,8 +414,8 @@ def worker_thread(worker_id, collection_name):
                 
                 print(f"👷 Worker {worker_id} processed batch: {len(processed_ids)} success, {len(failed_ids)} failed")
                 
-                # Small delay between batches
-                time.sleep(2)
+                # Random delay between batches
+                time.sleep(random.uniform(2, 5))
             
             except Exception as e:
                 print(f"❌ Worker {worker_id} failed to fetch batch: {str(e)}")
@@ -354,7 +425,7 @@ def worker_thread(worker_id, collection_name):
                         {'_id': {'$in': [doc['_id'] for doc in batch]}, 'status': 'processing'},
                         {'$set': {'status': 'new'}}
                     )
-                time.sleep(5)  # Wait before retrying
+                time.sleep(10)  # Longer wait before retrying
         
         print(f"🏁 Worker {worker_id} finished for collection {collection_name}")
         
@@ -363,9 +434,11 @@ def worker_thread(worker_id, collection_name):
     finally:
         active_workers -= 1
         if driver:
-            driver.quit()
-            print(f"🚪 Worker {worker_id} browser closed")
-
+            try:
+                driver.quit()
+                print(f"🚪 Worker {worker_id} browser closed")
+            except:
+                pass
 
 @app.route('/upload', methods=['POST'])
 def upload_excel():
@@ -662,20 +735,8 @@ def delete_collection(collection_name):
         return jsonify({'message': f'Collection {collection_name} deleted successfully'}), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
- 
+    
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 10000))
     print(f"🚀 Flask Backend Running on http://127.0.0.1:{port}")
     app.run(host='0.0.0.0', port=port, debug=True)
-
-
-
-
-
-
-
-
-
-
-
-
