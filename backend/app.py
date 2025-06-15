@@ -732,6 +732,7 @@ def retry_failed():
         return jsonify({'error': str(e)}), 500
  
 if __name__ == '__main__':
-    PORT = os.getenv('PORT', 9200)
-    print(f"🚀 Flask Backend Running on http://127.0.0.1:{PORT}")
-    app.run(debug=True, port=PORT)
+    port = int(os.getenv('PORT', 10000))
+    print(f"🚀 Flask Backend Running on http://0.0.0.0:{port}")
+    app.run(host='0.0.0.0', port=port, debug=False)  # Set debug=False for production
+
