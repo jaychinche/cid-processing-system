@@ -1,30 +1,57 @@
 services:
   - type: web
-    name: flask-scraper
+    name: flask-scraper            # ↳ change if you prefer another service name
     env: python
+    plan: free                     # or basic/pro/… – whatever you’re using
+    region: oregon                # pick the region you deploy to
     buildCommand: |
-      pip install -r requirements.txt
-      # Install Chrome dependencies
-      apt-get update
-      apt-get install -y wget gnupg unzip
-      # Install Google Chrome
+      set -e
+
+      # ---- 1. system packages -------------------------------------------------
+      apt-get update -qqy
+      apt-get install -qqy --no-install-recommends \
+        wget gnupg unzip ca-certificates
+      rm -rf /var/lib/apt/lists/*
+
+      # ---- 2. Google Chrome (stable) ------------------------------------------
       wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add -
-      echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
-      apt-get update
-      apt-get install -y google-chrome-stable
-      # Install ChromeDriver
-      CHROME_VERSION=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+')
-      wget -N https://chromedriver.storage.googleapis.com/LATEST_RELEASE_${CHROME_VERSION%.*} -O /tmp/chromedriver_version
-      CHROMEDRIVER_VERSION=$(cat /tmp/chromedriver_version)
-      wget -N https://chromedriver.storage.googleapis.com/${CHROMEDRIVER_VERSION}/chromedriver_linux64.zip -P /tmp/
-      unzip -o /tmp/chromedriver_linux64.zip -d /tmp/
-      mv /tmp/chromedriver /usr/local/bin/chromedriver
+      echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" \
+        > /etc/apt/sources.list.d/google-chrome.list
+      apt-get update -qqy
+      apt-get install -qqy --no-install-recommends google-chrome-stable
+      rm -rf /var/lib/apt/lists/*
+
+      # ---- 3. matching ChromeDriver -------------------------------------------
+      CHROME_MAJOR=$(google-chrome --version | grep -oP '\d+' | head -1)
+      DRIVER_VERSION=$(wget -qO- https://chromedriver.storage.googleapis.com/LATEST_RELEASE_${CHROME_MAJOR})
+      wget -q https://chromedriver.storage.googleapis.com/${DRIVER_VERSION}/chromedriver_linux64.zip
+      unzip -o chromedriver_linux64.zip -d /usr/local/bin/
       chmod +x /usr/local/bin/chromedriver
-    startCommand: gunicorn -w 1 -b 0.0.0.0:$PORT app:app --timeout 300 --keep-alive 5 --max-requests 100
+      rm chromedriver_linux64.zip
+
+      # ---- 4. Python dependencies ---------------------------------------------
+      pip install --no-cache-dir -r requirements.txt
+
+      # ---- 5. sanity checks (optional, but nice in build logs) -----------------
+      google-chrome --version
+      chromedriver --version
+
+    startCommand: |
+      gunicorn app:app \
+        --bind 0.0.0.0:$PORT \
+        --workers 1 \
+        --timeout 300 \
+        --keep-alive 5 \
+        --max-requests 100 \
+        --log-level info
+
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
+      - key: PYTHON_VERSION      # only needed if you rely on it in code
+        value: "3.11.0"
       - key: CHROME_BIN
         value: /usr/bin/google-chrome
       - key: CHROMEDRIVER_PATH
         value: /usr/local/bin/chromedriver
+      - key: DISPLAY
+        value: ":99"             # some headless libs look for this
+
