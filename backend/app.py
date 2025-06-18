@@ -14,6 +14,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
 from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.chrome.options import Options as ChromeOptions
 from webdriver_manager.chrome import ChromeDriverManager
 import requests
 import threading
@@ -142,6 +143,23 @@ def clean_amount(amount_text):
     except ValueError:
         return None
 
+def setup_driver():
+    """Configure ChromeDriver for Render environment"""
+    chrome_options = ChromeOptions()
+    
+    # Configuration for Render
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--headless=new')
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--window-size=1280,720')
+    
+    # Use webdriver_manager to handle ChromeDriver
+    service = ChromeService(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    
+    return driver
+
 def process_cid(driver, cid):
     """Process a single CID using Selenium"""
     retries = 0
@@ -244,11 +262,7 @@ def worker_thread(worker_id, collection_name):
     driver = None
     try:
         # Setup browser for this worker
-        options = webdriver.ChromeOptions()
-        options.add_argument('--headless')  # Run in headless mode for production
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
+        driver = setup_driver()
         
         print(f"👷 Worker {worker_id} started for collection {collection_name}")
         
@@ -564,6 +578,7 @@ def get_status():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
 @app.route('/download', methods=['GET'])
 def download_excel():
     try:
@@ -735,4 +750,3 @@ if __name__ == '__main__':
     port = int(os.getenv('PORT', 10000))
     print(f"🚀 Flask Backend Running on http://0.0.0.0:{port}")
     app.run(host='0.0.0.0', port=port, debug=False)  # Set debug=False for production
-
