@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from auth_routes import auth_bp
 from dotenv import load_dotenv
 import certifi 
+import tempfile
 
 app = Flask(__name__)
 CORS(app)  # Allow requests from frontend (e.g. React/Vue)
@@ -143,20 +144,26 @@ def clean_amount(amount_text):
     except ValueError:
         return None
 
-def setup_driver():
-    """Configure ChromeDriver for Render environment"""
-    chrome_options = ChromeOptions()
+def setup_browser():
+    """Configure and return a browser instance with proper options"""
+    options = ChromeOptions()
     
-    # Configuration for Render
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    chrome_options.add_argument('--headless=new')
-    chrome_options.add_argument('--disable-gpu')
-    chrome_options.add_argument('--window-size=1280,720')
+    # Configure browser options
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--headless=new')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--window-size=1280,720')
     
-    # Use webdriver_manager to handle ChromeDriver
-    service = ChromeService(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=chrome_options)
+    # Use unique temp directory for user data
+    temp_dir = tempfile.mkdtemp(prefix='chrome-')
+    options.add_argument(f'--user-data-dir={temp_dir}')
+    
+    # Set up the browser
+    driver = webdriver.Chrome(
+        service=ChromeService(ChromeDriverManager().install()),
+        options=options
+    )
     
     return driver
 
@@ -261,8 +268,8 @@ def worker_thread(worker_id, collection_name):
     
     driver = None
     try:
-        # Setup browser for this worker
-        driver = setup_driver()
+        # Setup browser for this worker with proper configuration
+        driver = setup_browser()
         
         print(f"👷 Worker {worker_id} started for collection {collection_name}")
         
@@ -405,8 +412,11 @@ def worker_thread(worker_id, collection_name):
     finally:
         active_workers -= 1
         if driver:
-            driver.quit()
-            print(f"🚪 Worker {worker_id} browser closed")
+            try:
+                driver.quit()
+                print(f"🚪 Worker {worker_id} browser closed")
+            except Exception as e:
+                print(f"⚠ Error closing browser for worker {worker_id}: {str(e)}")
 
 @app.route('/upload', methods=['POST'])
 def upload_excel():
@@ -489,7 +499,7 @@ def start_processing():
         num_workers = data.get('workers', 1)
         collection_name = data.get('collection', 'default_collection')
         
-        num_workers = max(1, min(num_workers, 100))  # Limit between 1 and 10 workers
+        num_workers = max(1, min(num_workers, 10))  # Limit between 1 and 10 workers
         
         should_stop = False
         should_pause = False
