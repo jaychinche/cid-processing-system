@@ -20,6 +20,7 @@ import requests
 import threading
 import signal
 import sys
+import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 from auth_routes import auth_bp
 from dotenv import load_dotenv
@@ -29,17 +30,33 @@ import tempfile
 app = Flask(__name__)
 CORS(app)  # Allow requests from frontend (e.g. React/Vue)
 
+# === Configuration ===
+load_dotenv()
+
+# Scraping Configuration
+CONFIG = {
+    'URL': "https://www.apeasternpower.com/viewBillDetailsMain",
+    'CHECK_INTERNET_URL': "http://www.google.com",
+    'MAX_RETRIES': 2,
+    'RETRY_DELAY': 10,
+    'BATCH_SIZE': 10,
+    'PORT': int(os.getenv('PORT', 10000)),
+    'MAX_WORKERS': max(1, min(4, multiprocessing.cpu_count() - 1)),  # 1-4 workers based on CPU cores
+    'STATUS_FILE': os.path.join(os.getcwd(), 'data', 'status.json'),
+    'FAILED_FILE': os.path.join(os.getcwd(), 'data', 'failed.json')
+}
+
+# Ensure data directory exists
+os.makedirs(os.path.join(os.getcwd(), 'data'), exist_ok=True)
+
 # === Global State ===
 should_pause = False
 should_stop = False
 active_workers = 0
 processing_active = False
 worker_threads = []
-current_collection_name = None  # Track the current collection being processed
-failed_count = 0  # Track total failed counts globally
-
-# Load environment variables
-load_dotenv()
+current_collection_name = None
+failed_count = 0
 
 # Initialize MongoDB
 MONGO_URI = os.getenv('MONGO_URI')
@@ -47,53 +64,48 @@ DB_NAME = os.getenv('DB_NAME')
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client[DB_NAME]
 
-# === Scraping Configuration ===
-URL = "https://www.apeasternpower.com/viewBillDetailsMain"
-CHECK_INTERVAL = 5  # Seconds between status checks
-CHECK_INTERNET_URL = "http://www.google.com"
-MAX_RETRIES = 2  # Changed from 3 to 2 as per requirement
-RETRY_DELAY = 10
-BATCH_SIZE = 10  # Number of CIDs each worker processes at a time
+app.register_blueprint(auth_bp, url_prefix='/api/auth')
 
+# === Helper Functions ===
 def get_collection(collection_name):
     """Get a MongoDB collection by name"""
     return db[collection_name]
 
-app.register_blueprint(auth_bp, url_prefix='/api/auth')
-
-@app.route('/send-dbname', methods=['POST'])
-def get_user_db():
-    """Get the user database collection"""
-    return get_userdb('user_db')
-
-@app.route('/set-db', methods=['POST'])
-def set_db():
-    global DB_NAME, db, client
-
-    data = request.get_json()
-    db_name = data.get('db_name')
-
-    if not db_name:
-        return jsonify({'error': 'Database name is required'}), 400
-
+def load_status():
+    """Load scraping status from file"""
     try:
-        MONGO_URI = os.getenv('MONGO_URI')
-        client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
-        db = client[db_name]
-        DB_NAME = db_name
-        print(f"✅ Database set to: {DB_NAME}")
-        return jsonify({'message': f'Database set to {DB_NAME}'}), 200
+        if os.path.exists(CONFIG['STATUS_FILE']) and os.path.getsize(CONFIG['STATUS_FILE']) > 0:
+            with open(CONFIG['STATUS_FILE'], 'r') as f:
+                return json.load(f)
     except Exception as e:
-        return jsonify({'error': f'Failed to connect to database: {str(e)}'}), 500
+        print(f"⚠ Couldn't read status file: {str(e)}")
+    return {'last_processed': 0, 'total_processed': 0, 'total_failed': 0}
 
-def signal_handler(sig, frame):
-    global should_stop
-    print("\n🛑 Received interrupt signal. Stopping gracefully...")
-    should_stop = True
-    if processing_active:
-        sys.exit(0)
+def save_status(status):
+    """Save scraping status to file"""
+    try:
+        with open(CONFIG['STATUS_FILE'], 'w') as f:
+            json.dump(status, f)
+    except Exception as e:
+        print(f"⚠ Couldn't save status file: {str(e)}")
 
-signal.signal(signal.SIGINT, signal_handler)
+def load_failed_cids():
+    """Load failed CIDs from file"""
+    try:
+        if os.path.exists(CONFIG['FAILED_FILE']) and os.path.getsize(CONFIG['FAILED_FILE']) > 0:
+            with open(CONFIG['FAILED_FILE'], 'r') as f:
+                return set(json.load(f))
+    except Exception as e:
+        print(f"⚠ Couldn't read failed CIDs file: {str(e)}")
+    return set()
+
+def save_failed_cids(failed_cids):
+    """Save failed CIDs to file"""
+    try:
+        with open(CONFIG['FAILED_FILE'], 'w') as f:
+            json.dump(list(failed_cids), f)
+    except Exception as e:
+        print(f"⚠ Couldn't save failed CIDs file: {str(e)}")
 
 def convert_date_fields(doc):
     """Convert date fields to datetime for MongoDB storage"""
@@ -106,7 +118,7 @@ def convert_date_fields(doc):
 def check_internet_connection():
     """Check if internet connection is available"""
     try:
-        requests.get(CHECK_INTERNET_URL, timeout=5)
+        requests.get(CONFIG['CHECK_INTERNET_URL'], timeout=5)
         return True
     except requests.ConnectionError:
         return False
@@ -172,14 +184,14 @@ def process_cid(driver, cid):
     retries = 0
     last_error = None
     
-    while retries < MAX_RETRIES and not should_stop:
+    while retries < CONFIG['MAX_RETRIES'] and not should_stop:
         try:
             if not check_internet_connection():
                 wait_for_internet()
                 if should_stop:
                     return None, None
             
-            driver.get(URL)
+            driver.get(CONFIG['URL'])
             time.sleep(2)
 
             # Enter CID
@@ -255,9 +267,9 @@ def process_cid(driver, cid):
         except Exception as e:
             retries += 1
             last_error = str(e)
-            print(f"⚠ Attempt {retries}/{MAX_RETRIES} failed for CID {cid}: {last_error[:100]}")
-            if retries < MAX_RETRIES and not should_stop:
-                time.sleep(RETRY_DELAY)
+            print(f"⚠ Attempt {retries}/{CONFIG['MAX_RETRIES']} failed for CID {cid}: {last_error[:100]}")
+            if retries < CONFIG['MAX_RETRIES'] and not should_stop:
+                time.sleep(CONFIG['RETRY_DELAY'])
     
     # If we get here, all attempts failed
     return None, last_error
@@ -276,134 +288,119 @@ def worker_thread(worker_id, collection_name):
         # Get the collection for this worker
         collection = get_collection(collection_name)
         
+        # Load existing status and failed CIDs
+        status = load_status()
+        failed_cids = load_failed_cids()
+        
+        # Get all CIDs in the collection
+        all_cids = [doc['cid'] for doc in collection.find({}, {'cid': 1})]
+        total_cids = len(all_cids)
+        
         while not should_stop:
             if check_pause():
                 should_stop = True
                 break
                 
-            # Fetch batch of CIDs to process
-            batch = []
-            try:
-                # Find documents that need processing
-                docs_to_process = list(collection.find(
-                    {'status': 'new'}, 
-                    limit=BATCH_SIZE
-                ))
-                
-                if not docs_to_process:
-                    print(f"ℹ Worker {worker_id}: No more CIDs to process in collection {collection_name}")
+            # Get next batch of CIDs to process
+            batch_start = status['last_processed']
+            batch_end = min(batch_start + CONFIG['BATCH_SIZE'], total_cids)
+            
+            if batch_start >= total_cids:
+                print(f"ℹ Worker {worker_id}: No more CIDs to process in collection {collection_name}")
+                break
+            
+            batch_cids = all_cids[batch_start:batch_end]
+            print(f"👷 Worker {worker_id} processing batch of {len(batch_cids)} CIDs ({batch_start+1}-{batch_end} of {total_cids})")
+            
+            processed_ids = []
+            failed_ids = []
+            
+            for cid in batch_cids:
+                if should_stop:
                     break
-                
-                # Update their status to 'processing' atomically
-                doc_ids = [doc['_id'] for doc in docs_to_process]
-                update_result = collection.update_many(
-                    {'_id': {'$in': doc_ids}, 'status': 'new'},  # Double-check they're still 'new'
-                    {'$set': {'status': 'processing'}}
-                )
-                
-                if update_result.modified_count == 0:
-                    print(f"ℹ Worker {worker_id}: Documents were already taken by another worker")
-                    continue
-                
-                # Get the updated documents
-                batch = list(collection.find({'_id': {'$in': doc_ids}, 'status': 'processing'}))
-                
-                if not batch:
-                    print(f"ℹ Worker {worker_id}: No documents to process in this batch")
-                    continue
-                
-                print(f"👷 Worker {worker_id} processing batch of {len(batch)} CIDs from collection {collection_name}")
-                
-                processed_ids = []
-                failed_ids = []
-                
-                for doc in batch:
-                    if should_stop:
-                        break
-                        
-                    cid = doc['cid']
-                    print(f"🔍 Worker {worker_id} processing CID {cid}")
                     
-                    try:
-                        monthly_data, error = process_cid(driver, cid)
-                        if monthly_data is not None:
-                            # Prepare update data with month-wise amounts
-                            update_data = {
-                                'status': 'pending',
-                                'processed_date': datetime.now().date(),
-                                'failed_attempts': 0,  # Reset attempts on success
-                                'fail_reason': None,   # Clear fail reason
-                                **monthly_data  # Add April25, May25, June25, Highest fields directly
-                            }
+                # Skip already processed or failed CIDs
+                if cid in failed_cids:
+                    continue
+                
+                # Get the document from MongoDB
+                doc = collection.find_one({'cid': cid})
+                if not doc:
+                    continue
+                
+                # Skip if already processed
+                if doc.get('status') == 'processed':
+                    continue
+                
+                print(f"🔍 Worker {worker_id} processing CID {cid}")
+                
+                try:
+                    monthly_data, error = process_cid(driver, cid)
+                    if monthly_data is not None:
+                        # Prepare update data with month-wise amounts
+                        update_data = {
+                            'status': 'processed',
+                            'processed_date': datetime.now().date(),
+                            'failed_attempts': 0,  # Reset attempts on success
+                            'fail_reason': None,   # Clear fail reason
+                            **monthly_data  # Add April25, May25, June25, Highest fields directly
+                        }
 
-                            update_data = convert_date_fields(update_data)
+                        update_data = convert_date_fields(update_data)
 
-                            collection.update_one(
-                                {'_id': doc['_id']},
-                                {'$set': update_data}
-                            )
-                            processed_ids.append(doc['_id'])
-                            print(f"✅ Worker {worker_id} processed CID {cid} - April25: {monthly_data.get('April25', 'N/A')}, May25: {monthly_data.get('May25', 'N/A')}, June25: {monthly_data.get('June25', 'N/A')}, Highest: {monthly_data.get('Highest', 'N/A')}")
-                        else:
-                            # Get current attempt count
-                            current_attempts = doc.get('failed_attempts', 0) + 1
-                            
-                            # Update document with failure info
-                            collection.update_one(
-                                {'_id': doc['_id']},
-                                {'$set': {
-                                    'status': 'failed' if current_attempts >= MAX_RETRIES else 'new',
-                                    'error': error[:500] if error else 'Unknown error',
-                                    'processed_date': datetime.now().date(),
-                                    'failed_attempts': current_attempts,
-                                    'fail_reason': error[:500] if error else 'Unknown error'
-                                }}
-                            )
-                            
-                            if current_attempts >= MAX_RETRIES:
-                                failed_ids.append(doc['_id'])
-                                failed_count += 1  # Increment global failed count
-                                print(f"❌ Worker {worker_id} failed to process CID {cid} after {MAX_RETRIES} attempts: {error[:100] if error else 'Unknown error'}...")
-                            else:
-                                print(f"⚠ Worker {worker_id} will retry CID {cid} (attempt {current_attempts}/{MAX_RETRIES})")
-                            
-                    except Exception as e:
-                        print(f"❌ Worker {worker_id} encountered unexpected error processing CID {cid}: {str(e)[:100]}...")
+                        collection.update_one(
+                            {'_id': doc['_id']},
+                            {'$set': update_data}
+                        )
+                        processed_ids.append(doc['_id'])
+                        print(f"✅ Worker {worker_id} processed CID {cid} - April25: {monthly_data.get('April25', 'N/A')}, May25: {monthly_data.get('May25', 'N/A')}, June25: {monthly_data.get('June25', 'N/A')}, Highest: {monthly_data.get('Highest', 'N/A')}")
+                    else:
+                        # Update document with failure info
+                        failed_cids.add(cid)
                         collection.update_one(
                             {'_id': doc['_id']},
                             {'$set': {
                                 'status': 'failed',
-                                'error': str(e)[:500],
+                                'error': error[:500] if error else 'Unknown error',
                                 'processed_date': datetime.now().date(),
-                                'failed_attempts': MAX_RETRIES,  # Mark as max attempts
-                                'fail_reason': str(e)[:500]
+                                'failed_attempts': CONFIG['MAX_RETRIES'],
+                                'fail_reason': error[:500] if error else 'Unknown error'
                             }}
                         )
+                        
                         failed_ids.append(doc['_id'])
-                        failed_count += 1
-                
-                # After batch processed, update status of all successfully processed documents from 'pending' to 'processed'
-                if processed_ids:
-                    collection.update_many(
-                        {'_id': {'$in': processed_ids}, 'status': 'pending'},
-                        {'$set': {'status': 'processed'}}
+                        failed_count += 1  # Increment global failed count
+                        print(f"❌ Worker {worker_id} failed to process CID {cid} after {CONFIG['MAX_RETRIES']} attempts: {error[:100] if error else 'Unknown error'}...")
+                        
+                except Exception as e:
+                    print(f"❌ Worker {worker_id} encountered unexpected error processing CID {cid}: {str(e)[:100]}...")
+                    failed_cids.add(cid)
+                    collection.update_one(
+                        {'_id': doc['_id']},
+                        {'$set': {
+                            'status': 'failed',
+                            'error': str(e)[:500],
+                            'processed_date': datetime.now().date(),
+                            'failed_attempts': CONFIG['MAX_RETRIES'],  # Mark as max attempts
+                            'fail_reason': str(e)[:500]
+                        }}
                     )
-                    print(f"🔄 Worker {worker_id} updated status of {len(processed_ids)} CIDs from 'pending' to 'processed'")
-                
-                print(f"👷 Worker {worker_id} processed batch: {len(processed_ids)} success, {len(failed_ids)} failed")
-                
-                # Small delay between batches
-                time.sleep(2)
+                    failed_ids.append(doc['_id'])
+                    failed_count += 1
             
-            except Exception as e:
-                print(f"❌ Worker {worker_id} failed to fetch batch: {str(e)}")
-                # If we failed to process the batch, mark them back as 'new' so other workers can try
-                if batch:
-                    collection.update_many(
-                        {'_id': {'$in': [doc['_id'] for doc in batch]}, 'status': 'processing'},
-                        {'$set': {'status': 'new'}}
-                    )
-                time.sleep(5)  # Wait before retrying
+            # Update status after batch processing
+            status['last_processed'] = batch_end
+            status['total_processed'] = (status.get('total_processed', 0) + len(processed_ids))
+            status['total_failed'] = failed_count
+            save_status(status)
+            
+            # Save failed CIDs
+            save_failed_cids(failed_cids)
+            
+            print(f"📊 Worker {worker_id} batch results: {len(processed_ids)} success, {len(failed_ids)} failed")
+            
+            # Small delay between batches
+            time.sleep(2)
         
         print(f"🏁 Worker {worker_id} finished for collection {collection_name}")
         
@@ -417,6 +414,32 @@ def worker_thread(worker_id, collection_name):
                 print(f"🚪 Worker {worker_id} browser closed")
             except Exception as e:
                 print(f"⚠ Error closing browser for worker {worker_id}: {str(e)}")
+
+# === API Endpoints ===
+@app.route('/send-dbname', methods=['POST'])
+def get_user_db():
+    """Get the user database collection"""
+    return get_userdb('user_db')
+
+@app.route('/set-db', methods=['POST'])
+def set_db():
+    global DB_NAME, db, client
+
+    data = request.get_json()
+    db_name = data.get('db_name')
+
+    if not db_name:
+        return jsonify({'error': 'Database name is required'}), 400
+
+    try:
+        MONGO_URI = os.getenv('MONGO_URI')
+        client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
+        db = client[db_name]
+        DB_NAME = db_name
+        print(f"✅ Database set to: {DB_NAME}")
+        return jsonify({'message': f'Database set to {DB_NAME}'}), 200
+    except Exception as e:
+        return jsonify({'error': f'Failed to connect to database: {str(e)}'}), 500
 
 @app.route('/upload', methods=['POST'])
 def upload_excel():
@@ -496,10 +519,11 @@ def start_processing():
     try:
         # Get parameters from request
         data = request.get_json()
-        num_workers = data.get('workers', 1)
+        num_workers = data.get('workers', CONFIG['MAX_WORKERS'])
         collection_name = data.get('collection', 'default_collection')
         
-        num_workers = max(1, min(num_workers, 10))  # Limit between 1 and 10 workers
+        # Limit workers based on configuration
+        num_workers = max(1, min(num_workers, CONFIG['MAX_WORKERS']))
         
         should_stop = False
         should_pause = False
@@ -508,19 +532,28 @@ def start_processing():
         current_collection_name = collection_name
         failed_count = 0  # Reset failed count when starting new processing
         
+        # Initialize status
+        save_status({
+            'last_processed': 0,
+            'total_processed': 0,
+            'total_failed': 0
+        })
+        
         # Clear any existing worker threads
         worker_threads = []
         
         # Start worker threads
         for i in range(num_workers):
             t = threading.Thread(target=worker_thread, args=(i+1, collection_name))
+            t.daemon = True  # Allow thread to exit when main program exits
             t.start()
             worker_threads.append(t)
         
         return jsonify({
             'message': f'Processing started with {num_workers} workers on collection {collection_name}',
             'workers': num_workers,
-            'collection': collection_name
+            'collection': collection_name,
+            'max_workers': CONFIG['MAX_WORKERS']
         }), 200
         
     except Exception as e:
@@ -573,6 +606,9 @@ def get_status():
         # Get all unique tags in the collection
         tags = collection.distinct('tag')
 
+        # Load status from file
+        file_status = load_status()
+
         return jsonify({
             'total': total,
             'processed': processed,
@@ -582,9 +618,14 @@ def get_status():
             'processing_active': processing_active,
             'active_workers': active_workers,
             'paused': should_pause,
+            'stopped': should_stop,
             'current_collection': collection_name,
             'tags': tags,
-            'current_failed_count': failed_count  # Include current failed count in status
+            'current_failed_count': failed_count,
+            'last_processed': file_status.get('last_processed', 0),
+            'total_processed': file_status.get('total_processed', 0),
+            'total_failed': file_status.get('total_failed', 0),
+            'max_workers': CONFIG['MAX_WORKERS']
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -747,6 +788,8 @@ def retry_failed():
             }}
         )
         
+        # Clear failed CIDs file
+        save_failed_cids(set())
         failed_count = 0  # Reset failed count
         
         return jsonify({
@@ -755,8 +798,17 @@ def retry_failed():
         }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
- 
+
+def signal_handler(sig, frame):
+    global should_stop
+    print("\n🛑 Received interrupt signal. Stopping gracefully...")
+    should_stop = True
+    if processing_active:
+        sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
 if __name__ == '__main__':
-    port = int(os.getenv('PORT', 10000))
-    print(f"🚀 Flask Backend Running on http://0.0.0.0:{port}")
-    app.run(host='0.0.0.0', port=port, debug=False)  # Set debug=False for production
+    print(f"🚀 Flask Backend Running on http://0.0.0.0:{CONFIG['PORT']}")
+    print(f"⚙️  Configuration: Max Workers: {CONFIG['MAX_WORKERS']}, Batch Size: {CONFIG['BATCH_SIZE']}, Max Retries: {CONFIG['MAX_RETRIES']}")
+    app.run(host='0.0.0.0', port=CONFIG['PORT'], debug=False)
